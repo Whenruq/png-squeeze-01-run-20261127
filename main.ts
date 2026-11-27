@@ -1,376 +1,332 @@
-// png-squeeze: lossless PNG re-encoder.
-// Reads each /input/<id>/image.png (1280x720 RGBA stored PNG) and writes the
-// same pixels back as the smallest PNG it can: colour-type reduction
-// (grey / palette / RGB / RGBA), per-row adaptive filter choice by MSAD,
-// zlib level 9. Zero dependencies (node:fs, node:path, node:zlib only).
-
-import { readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+// png-squeeze entry: re-encode each 1280x720 RGBA screenshot losslessly as the smallest PNG we can.
+// Strategy: decode to RGBA, build every lossless form (palette when <=256 colours, grey / grey+alpha,
+// RGB / RGBA, with a tRNS key when one transparent value allows dropping the alpha channel), screen
+// each form x filter choice with zlib level 6, then re-compress the best few at level 9 and keep the
+// smallest file. Deterministic: fixed trial set, no clock, no randomness.
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { inflateSync, deflateSync } from 'node:zlib';
+import { constants, deflateSync, inflateSync } from 'node:zlib';
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// ---------- CRC32 (table-based) ----------
+// ---------- PNG decode (bit depth 8, non-interlaced; colour types 0,2,4,6 and palette input) ----------
 const CRC_TABLE = (() => {
-  const t = new Uint32Array(256);
+  const t = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
+    t[n] = c;
   }
   return t;
 })();
-
-function crc32(buf: Uint8Array): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
+function crc32(bytes, start, end) {
+  let c = -1;
+  for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
 }
-
-// ---------- PNG decode to RGBA ----------
-interface Decoded {
-  width: number;
-  height: number;
-  rgba: Uint8Array; // width*height*4
-}
-
-function paeth(a: number, b: number, c: number): number {
+function paeth(a, b, c) {
   const p = a + b - c;
-  const pa = Math.abs(p - a);
-  const pb = Math.abs(p - b);
-  const pc = Math.abs(p - c);
-  if (pa <= pb && pa <= pc) return a;
-  if (pb <= pc) return b;
-  return c;
+  const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+  return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
 }
-
-function unfilter(raw: Uint8Array, width: number, height: number, bpp: number): Uint8Array {
-  const rowBytes = width * bpp;
-  const out = new Uint8Array(rowBytes * height);
-  let src = 0;
-  for (let y = 0; y < height; y++) {
-    const filter = raw[src++];
-    const rowOff = y * rowBytes;
-    const prevOff = rowOff - rowBytes;
-    for (let x = 0; x < rowBytes; x++) {
-      const v = raw[src++];
-      const left = x >= bpp ? out[rowOff + x - bpp] : 0;
-      const up = y > 0 ? out[prevOff + x] : 0;
-      const upLeft = y > 0 && x >= bpp ? out[prevOff + x - bpp] : 0;
-      let recon: number;
-      switch (filter) {
-        case 0: recon = v; break;
-        case 1: recon = v + left; break;
-        case 2: recon = v + up; break;
-        case 3: recon = v + ((left + up) >> 1); break;
-        case 4: recon = v + paeth(left, up, upLeft); break;
-        default: throw new Error('bad filter ' + filter);
-      }
-      out[rowOff + x] = recon & 0xff;
-    }
-  }
-  return out;
-}
-
-function decodePng(buf: Buffer): Decoded {
-  const sig = [137, 80, 78, 71, 13, 10, 26, 10];
-  for (let i = 0; i < 8; i++) if (buf[i] !== sig[i]) throw new Error('not a PNG');
-  let width = 0;
-  let height = 0;
-  let bitDepth = 8;
-  let colorType = 6;
-  const idatParts: Buffer[] = [];
-  let pos = 8;
-  while (pos + 8 <= buf.length) {
-    const len = buf.readUInt32BE(pos);
-    const type = buf.toString('ascii', pos + 4, pos + 8);
-    const data = buf.subarray(pos + 8, pos + 8 + len);
+function decodePng(buf) {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let width = 0, height = 0, colourType = 6;
+  let plte = null, trns = null;
+  const idat = [];
+  let at = 8;
+  while (at < buf.length) {
+    const len = view.getUint32(at);
+    const type = String.fromCharCode(buf[at + 4], buf[at + 5], buf[at + 6], buf[at + 7]);
+    const data = buf.subarray(at + 8, at + 8 + len);
     if (type === 'IHDR') {
-      width = data.readUInt32BE(0);
-      height = data.readUInt32BE(4);
-      bitDepth = data[8];
-      colorType = data[9];
-    } else if (type === 'IDAT') {
-      idatParts.push(Buffer.from(data));
-    } else if (type === 'IEND') {
-      break;
-    }
-    pos += 12 + len;
+      width = view.getUint32(at + 8);
+      height = view.getUint32(at + 12);
+      colourType = buf[at + 17];
+    } else if (type === 'PLTE') plte = data;
+    else if (type === 'tRNS') trns = data;
+    else if (type === 'IDAT') idat.push(data);
+    else if (type === 'IEND') break;
+    at += 12 + len;
   }
-  if (bitDepth !== 8) throw new Error('unsupported bit depth ' + bitDepth);
-  const channels = colorType === 6 ? 4 : colorType === 2 ? 3 : colorType === 4 ? 2 : 1;
-  const raw = inflateSync(Buffer.concat(idatParts));
-  const px = unfilter(raw, width, height, channels);
+  const ch = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[colourType];
+  const raw = inflateSync(Buffer.concat(idat.map((d) => Buffer.from(d.buffer, d.byteOffset, d.byteLength))));
+  const stride = width * ch;
+  const samples = new Uint8Array(height * stride);
+  for (let y = 0; y < height; y++) {
+    const f = raw[y * (stride + 1)];
+    const rowIn = y * (stride + 1) + 1;
+    const rowOut = y * stride;
+    for (let x = 0; x < stride; x++) {
+      const v = raw[rowIn + x];
+      const a = x >= ch ? samples[rowOut + x - ch] : 0;
+      const b = y > 0 ? samples[rowOut - stride + x] : 0;
+      const c = y > 0 && x >= ch ? samples[rowOut - stride + x - ch] : 0;
+      let r;
+      if (f === 0) r = v;
+      else if (f === 1) r = (v + a) & 255;
+      else if (f === 2) r = (v + b) & 255;
+      else if (f === 3) r = (v + ((a + b) >> 1)) & 255;
+      else r = (v + paeth(a, b, c)) & 255;
+      samples[rowOut + x] = r;
+    }
+  }
   const rgba = new Uint8Array(width * height * 4);
-  const n = width * height;
-  if (colorType === 6) {
-    rgba.set(px);
-  } else if (colorType === 2) {
-    for (let i = 0; i < n; i++) {
-      rgba[i * 4] = px[i * 3];
-      rgba[i * 4 + 1] = px[i * 3 + 1];
-      rgba[i * 4 + 2] = px[i * 3 + 2];
-      rgba[i * 4 + 3] = 255;
+  const keyGrey = colourType === 0 && trns ? (trns[0] << 8) | trns[1] : -1;
+  const keyRgb = colourType === 2 && trns ? [(trns[1]), (trns[3]), (trns[5])] : null;
+  for (let i = 0, s = 0, d = 0; i < width * height; i++, s += ch, d += 4) {
+    if (colourType === 6) {
+      rgba[d] = samples[s]; rgba[d + 1] = samples[s + 1]; rgba[d + 2] = samples[s + 2]; rgba[d + 3] = samples[s + 3];
+    } else if (colourType === 2) {
+      rgba[d] = samples[s]; rgba[d + 1] = samples[s + 1]; rgba[d + 2] = samples[s + 2];
+      rgba[d + 3] = keyRgb && samples[s] === keyRgb[0] && samples[s + 1] === keyRgb[1] && samples[s + 2] === keyRgb[2] ? 0 : 255;
+    } else if (colourType === 0) {
+      rgba[d] = rgba[d + 1] = rgba[d + 2] = samples[s];
+      rgba[d + 3] = samples[s] === keyGrey ? 0 : 255;
+    } else if (colourType === 4) {
+      rgba[d] = rgba[d + 1] = rgba[d + 2] = samples[s]; rgba[d + 3] = samples[s + 1];
+    } else if (colourType === 3) {
+      const p = samples[s] * 3;
+      rgba[d] = plte[p]; rgba[d + 1] = plte[p + 1]; rgba[d + 2] = plte[p + 2];
+      rgba[d + 3] = trns && samples[s] < trns.length ? trns[samples[s]] : 255;
     }
-  } else if (colorType === 4) {
-    for (let i = 0; i < n; i++) {
-      const g = px[i * 2];
-      rgba[i * 4] = g;
-      rgba[i * 4 + 1] = g;
-      rgba[i * 4 + 2] = g;
-      rgba[i * 4 + 3] = px[i * 2 + 1];
-    }
-  } else if (colorType === 0) {
-    for (let i = 0; i < n; i++) {
-      const g = px[i];
-      rgba[i * 4] = g;
-      rgba[i * 4 + 1] = g;
-      rgba[i * 4 + 2] = g;
-      rgba[i * 4 + 3] = 255;
-    }
-  } else {
-    throw new Error('unsupported colour type ' + colorType);
   }
-  return { width, height, rgba };
+  return { rgba, width, height };
 }
 
-// ---------- PNG encode ----------
-function chunk(type: string, data: Uint8Array): Buffer {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, 'ascii');
-  out.set(data, 8);
-  const crc = crc32(out.subarray(4, 8 + data.length));
-  out.writeUInt32BE(crc, 8 + data.length);
+// ---------- PNG encode helpers ----------
+const SIGNATURE = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
+function pngOf(chunks) {
+  let size = 8;
+  for (const [, data] of chunks) size += 12 + data.length;
+  const out = new Uint8Array(size);
+  const view = new DataView(out.buffer);
+  out.set(SIGNATURE, 0);
+  let at = 8;
+  for (const [type, data] of chunks) {
+    view.setUint32(at, data.length);
+    for (let i = 0; i < 4; i++) out[at + 4 + i] = type.charCodeAt(i);
+    out.set(data, at + 8);
+    view.setUint32(at + 8 + data.length, crc32(out, at + 4, at + 8 + data.length));
+    at += 12 + data.length;
+  }
   return out;
 }
-
-function filterRow(
-  filter: number,
-  cur: Uint8Array,
-  curOff: number,
-  prev: Uint8Array | null,
-  prevOff: number,
-  rowBytes: number,
-  bpp: number,
-  dest: Uint8Array,
-  destOff: number
-): void {
-  for (let x = 0; x < rowBytes; x++) {
-    const v = cur[curOff + x];
-    const left = x >= bpp ? cur[curOff + x - bpp] : 0;
-    const up = prev ? prev[prevOff + x] : 0;
-    const upLeft = prev && x >= bpp ? prev[prevOff + x - bpp] : 0;
-    let pred: number;
-    switch (filter) {
-      case 0: pred = 0; break;
-      case 1: pred = left; break;
-      case 2: pred = up; break;
-      case 3: pred = (left + up) >> 1; break;
-      default: pred = paeth(left, up, upLeft); break;
-    }
-    dest[destOff + x] = (v - pred) & 0xff;
+function ihdrOf(width, height, colourType) {
+  const d = new Uint8Array(13);
+  const v = new DataView(d.buffer);
+  v.setUint32(0, width);
+  v.setUint32(4, height);
+  d[8] = 8;
+  d[9] = colourType;
+  return d;
+}
+function filterRow(type, cur, prev, bpp, out) {
+  for (let x = 0; x < cur.length; x++) {
+    const a = x >= bpp ? cur[x - bpp] : 0;
+    const b = prev ? prev[x] : 0;
+    const c = prev && x >= bpp ? prev[x - bpp] : 0;
+    let p = 0;
+    if (type === 1) p = a;
+    else if (type === 2) p = b;
+    else if (type === 3) p = (a + b) >> 1;
+    else if (type === 4) p = paeth(a, b, c);
+    out[x] = (cur[x] - p) & 255;
   }
 }
-
-function msad(buf: Uint8Array, off: number, len: number): number {
+function signedSum(row) {
   let s = 0;
-  for (let i = 0; i < len; i++) {
-    const b = buf[off + i];
-    s += b <= 127 ? b : 256 - b;
-  }
+  for (let i = 0; i < row.length; i++) s += row[i] < 128 ? row[i] : 256 - row[i];
   return s;
 }
-
-/** Filter every row adaptively (MSAD-minimal filter per row). Returns the filtered stream. */
-function filterAdaptive(raw: Uint8Array, width: number, height: number, bpp: number): Buffer {
-  const rowBytes = width * bpp;
-  const out = Buffer.alloc(height * (rowBytes + 1));
-  const scratch = new Uint8Array(rowBytes);
+function pairsOf(row, seen, stamp) {
+  let n = 0;
+  for (let i = 1; i < row.length; i++) {
+    const pair = (row[i - 1] << 8) | row[i];
+    if (seen[pair] !== stamp) { seen[pair] = stamp; n++; }
+  }
+  return n;
+}
+function filtered(samples, width, height, bpp, choice) {
+  const stride = width * bpp;
+  const raw = new Uint8Array(height * (stride + 1));
+  const trial = Array.from({ length: 5 }, (_, t) => {
+    const row = new Uint8Array(stride + 1);
+    row[0] = t;
+    return row;
+  });
+  const seen = new Uint32Array(65536);
+  let stamp = 0;
   for (let y = 0; y < height; y++) {
-    const curOff = y * rowBytes;
-    const prev = y > 0 ? raw : null;
-    const prevOff = curOff - rowBytes;
-    const outOff = y * (rowBytes + 1);
-    let bestFilter = 0;
-    let bestScore = Infinity;
-    for (let f = 0; f < 5; f++) {
-      filterRow(f, raw, curOff, prev, prevOff, rowBytes, bpp, scratch, 0);
-      const score = msad(scratch, 0, rowBytes);
-      if (score < bestScore) {
-        bestScore = score;
-        bestFilter = f;
-        out.set(scratch, outOff + 1);
-      }
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = y * (stride + 1);
+    if (typeof choice === 'number') {
+      raw[at] = choice;
+      filterRow(choice, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
+      continue;
     }
-    out[outOff] = bestFilter;
+    let type = 0, best = Infinity;
+    for (let t = 0; t < 5; t++) {
+      filterRow(t, cur, prev, bpp, trial[t].subarray(1));
+      const cost = choice === 'minsum' ? signedSum(trial[t].subarray(1)) : pairsOf(trial[t].subarray(1), seen, ++stamp);
+      if (cost < best) { best = cost; type = t; }
+    }
+    raw.set(trial[type], at);
+  }
+  return raw;
+}
+
+// ---------- Image analysis & forms ----------
+function wordsOf(rgba) {
+  const at = rgba.byteOffset % 4 === 0 ? rgba : rgba.slice();
+  return new Uint32Array(at.buffer, at.byteOffset, at.length >>> 2);
+}
+function analyse(rgba) {
+  const n = rgba.length >>> 2;
+  const u32 = wordsOf(rgba);
+  let opaque = true, grey = true;
+  const counts = new Map();
+  let many = false;
+  for (let i = 0, d = 0; i < n; i++, d += 4) {
+    if (rgba[d + 3] !== 255) opaque = false;
+    if (rgba[d] !== rgba[d + 1] || rgba[d] !== rgba[d + 2]) grey = false;
+    if (!many) {
+      const c = u32[i];
+      const k = counts.get(c);
+      if (k === undefined) {
+        if (counts.size === 256) many = true;
+        else counts.set(c, 1);
+      } else counts.set(c, k + 1);
+    }
+  }
+  const colours = many ? null : [...counts.keys()].map((c) => {
+    const b = new Uint8Array(Uint32Array.of(c).buffer);
+    return { rgba: [b[0], b[1], b[2], b[3]], word: c, count: counts.get(c) };
+  });
+  return { opaque, grey, colours };
+}
+function transparentKey(rgba, grey) {
+  let key = -1;
+  for (let d = 0; d < rgba.length; d += 4) {
+    const a = rgba[d + 3];
+    if (a === 255) continue;
+    if (a !== 0) return null;
+    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
+    if (key === -1) key = v;
+    else if (key !== v) return null;
+  }
+  if (key === -1) return null;
+  for (let d = 0; d < rgba.length; d += 4) {
+    if (rgba[d + 3] !== 255) continue;
+    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
+    if (v === key) return null;
+  }
+  return key;
+}
+function samplesOf(rgba, ct) {
+  const n = rgba.length >>> 2;
+  if (ct === 6) return rgba;
+  const ch = ct === 0 ? 1 : ct === 4 ? 2 : 3;
+  const out = new Uint8Array(n * ch);
+  for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += ch) {
+    if (ct === 0) out[s] = rgba[d];
+    else if (ct === 4) { out[s] = rgba[d]; out[s + 1] = rgba[d + 3]; }
+    else { out[s] = rgba[d]; out[s + 1] = rgba[d + 1]; out[s + 2] = rgba[d + 2]; }
   }
   return out;
 }
-
-/** Filter every row with one fixed filter type. Returns the filtered stream. */
-function filterFixed(
-  raw: Uint8Array,
-  width: number,
-  height: number,
-  bpp: number,
-  filter: number
-): Buffer {
-  const rowBytes = width * bpp;
-  const out = Buffer.alloc(height * (rowBytes + 1));
-  for (let y = 0; y < height; y++) {
-    const curOff = y * rowBytes;
-    const prev = y > 0 ? raw : null;
-    const prevOff = curOff - rowBytes;
-    const outOff = y * (rowBytes + 1);
-    out[outOff] = filter;
-    filterRow(filter, raw, curOff, prev, prevOff, rowBytes, bpp, out, outOff + 1);
+function paletteForm(rgba, colours, order) {
+  const lum = (c) => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
+  const entries = [...colours].sort((x, y) => {
+    const ta = x.rgba[3] === 255 ? 1 : 0;
+    const tb = y.rgba[3] === 255 ? 1 : 0;
+    if (ta !== tb) return ta - tb;
+    if (ta === 0 && x.rgba[3] !== y.rgba[3]) return x.rgba[3] - y.rgba[3];
+    if (order === 'luminance') return lum(x) - lum(y) || x.word - y.word;
+    return y.count - x.count || x.word - y.word;
+  });
+  const index = new Map(entries.map((c, i) => [c.word, i]));
+  const plte = new Uint8Array(entries.length * 3);
+  let transparent = 0;
+  entries.forEach((c, i) => {
+    plte[i * 3] = c.rgba[0];
+    plte[i * 3 + 1] = c.rgba[1];
+    plte[i * 3 + 2] = c.rgba[2];
+    if (c.rgba[3] !== 255) transparent = i + 1;
+  });
+  const trns = transparent === 0 ? null : Uint8Array.from(entries.slice(0, transparent), (c) => c.rgba[3]);
+  const n = rgba.length >>> 2;
+  const u32 = wordsOf(rgba);
+  const indices = new Uint8Array(n);
+  for (let i = 0; i < n; i++) indices[i] = index.get(u32[i]);
+  return { plte, trns, indices };
+}
+function formsOf(rgba) {
+  const { opaque, grey, colours } = analyse(rgba);
+  const forms = [];
+  if (colours !== null) {
+    for (const [order, filters] of [
+      ['count', [0, 'minsum']],
+      ['luminance', [0, 'minsum', 'pairs']],
+    ]) {
+      const p = paletteForm(rgba, colours, order);
+      forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters });
+    }
+    if (!grey) return forms;
   }
-  return out;
-}
-
-interface Candidate {
-  colorType: number;
-  raw: Uint8Array; // unfiltered pixel rows in this colour type's layout
-  bpp: number;
-  plte?: Uint8Array;
-  trns?: Uint8Array;
-}
-
-function assemble(width: number, height: number, cand: Candidate, filtered: Buffer): Buffer {
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = cand.colorType;
-  ihdr[10] = 0; // compression
-  ihdr[11] = 0; // filter method
-  ihdr[12] = 0; // interlace
-  const compressed = deflateSync(filtered, { level: 9, memLevel: 9 });
-  const parts: Buffer[] = [
-    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    chunk('IHDR', ihdr),
-  ];
-  if (cand.plte) parts.push(chunk('PLTE', cand.plte));
-  if (cand.trns) parts.push(chunk('tRNS', cand.trns));
-  parts.push(chunk('IDAT', compressed));
-  parts.push(chunk('IEND', new Uint8Array(0)));
-  return Buffer.concat(parts);
-}
-
-function encodeCandidate(width: number, height: number, cand: Candidate): Buffer {
-  // Try both the adaptive (per-row MSAD) stream and a fixed-Paeth stream;
-  // MSAD is a heuristic, so on some rows the uniform Paeth stream deflates
-  // smaller. Keep whichever complete PNG is fewer bytes.
-  const adaptive = assemble(width, height, cand, filterAdaptive(cand.raw, width, height, cand.bpp));
-  const paeth = assemble(width, height, cand, filterFixed(cand.raw, width, height, cand.bpp, 4));
-  return paeth.length < adaptive.length ? paeth : adaptive;
-}
-
-// ---------- re-encode one image ----------
-function reencode(img: Decoded): Buffer {
-  const { width, height, rgba } = img;
-  const n = width * height;
-
-  // Analyse once.
-  let allOpaque = true;
-  let allGrey = true;
-  const uniq = new Map<number, number>(); // rgba key -> palette index (first-seen order)
-  let tooManyColors = false;
-  for (let i = 0; i < n; i++) {
-    const r = rgba[i * 4];
-    const g = rgba[i * 4 + 1];
-    const b = rgba[i * 4 + 2];
-    const a = rgba[i * 4 + 3];
-    if (a !== 255) allOpaque = false;
-    if (r !== g || g !== b) allGrey = false;
-    if (!tooManyColors) {
-      const key = ((r << 24) | (g << 16) | (b << 8) | a) >>> 0;
-      if (!uniq.has(key)) {
-        if (uniq.size >= 256) tooManyColors = true;
-        else uniq.set(key, uniq.size);
-      }
-    }
-  }
-
-  const candidates: Candidate[] = [];
-
-  // Direct candidate (grey / RGB / RGBA).
-  if (allGrey) {
-    if (allOpaque) {
-      const raw = new Uint8Array(n);
-      for (let i = 0; i < n; i++) raw[i] = rgba[i * 4];
-      candidates.push({ colorType: 0, raw, bpp: 1 });
-    } else {
-      const raw = new Uint8Array(n * 2);
-      for (let i = 0; i < n; i++) {
-        raw[i * 2] = rgba[i * 4];
-        raw[i * 2 + 1] = rgba[i * 4 + 3];
-      }
-      candidates.push({ colorType: 4, raw, bpp: 2 });
-    }
-  } else if (allOpaque) {
-    const raw = new Uint8Array(n * 3);
-    for (let i = 0; i < n; i++) {
-      raw[i * 3] = rgba[i * 4];
-      raw[i * 3 + 1] = rgba[i * 4 + 1];
-      raw[i * 3 + 2] = rgba[i * 4 + 2];
-    }
-    candidates.push({ colorType: 2, raw, bpp: 3 });
+  const key = opaque ? null : transparentKey(rgba, grey);
+  let ct, trns = null;
+  if (grey) {
+    ct = opaque || key !== null ? 0 : 4;
+    if (key !== null) trns = Uint8Array.of(0, key);
   } else {
-    candidates.push({ colorType: 6, raw: rgba, bpp: 4 });
+    ct = opaque || key !== null ? 2 : 6;
+    if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
   }
-
-  // Palette candidate when the colour count fits.
-  if (!tooManyColors) {
-    const count = uniq.size;
-    const plte = new Uint8Array(count * 3);
-    const alphas = new Uint8Array(count);
-    for (const [key, idx] of uniq) {
-      plte[idx * 3] = (key >>> 24) & 0xff;
-      plte[idx * 3 + 1] = (key >>> 16) & 0xff;
-      plte[idx * 3 + 2] = (key >>> 8) & 0xff;
-      alphas[idx] = key & 0xff;
-    }
-    let trnsLen = count;
-    while (trnsLen > 0 && alphas[trnsLen - 1] === 255) trnsLen--;
-    const raw = new Uint8Array(n);
-    for (let i = 0; i < n; i++) {
-      const key =
-        ((rgba[i * 4] << 24) | (rgba[i * 4 + 1] << 16) | (rgba[i * 4 + 2] << 8) | rgba[i * 4 + 3]) >>> 0;
-      raw[i] = uniq.get(key) as number;
-    }
-    candidates.push({
-      colorType: 3,
-      raw,
-      bpp: 1,
-      plte,
-      trns: trnsLen > 0 ? alphas.subarray(0, trnsLen) : undefined,
-    });
-  }
-
-  let best: Buffer | null = null;
-  for (const cand of candidates) {
-    const png = encodeCandidate(width, height, cand);
-    if (best === null || png.length < best.length) best = png;
-  }
-  return best as Buffer;
+  const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct];
+  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns, filters: [0, 1, 2, 4, 'minsum', 'pairs'] });
+  return forms;
+}
+const chunkBytes = (form) => (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
+function pngOfForm(width, height, form, idat) {
+  const chunks = [['IHDR', ihdrOf(width, height, form.colourType)]];
+  if (form.plte !== null) chunks.push(['PLTE', form.plte]);
+  if (form.trns !== null) chunks.push(['tRNS', form.trns]);
+  chunks.push(['IDAT', idat]);
+  chunks.push(['IEND', new Uint8Array(0)]);
+  return pngOf(chunks);
 }
 
-// ---------- main ----------
-const ids = readdirSync(INPUT_DIR).sort();
-for (const id of ids) {
-  const inPath = join(INPUT_DIR, id, 'image.png');
-  let buf: Buffer;
-  try {
-    buf = readFileSync(inPath);
-  } catch {
-    continue;
+// ---------- Squeeze one image ----------
+function squeeze(rgba, width, height) {
+  const screened = [];
+  for (const form of formsOf(rgba)) {
+    const chunks = chunkBytes(form);
+    for (const choice of form.filters) {
+      const data = filtered(form.samples, width, height, form.bpp, choice);
+      const z = deflateSync(data, { level: 6, memLevel: 8 });
+      screened.push({ form, choice, data, bytes: z.length + chunks });
+    }
   }
-  const img = decodePng(buf);
-  const out = reencode(img);
-  const outDir = join(OUTPUT_DIR, id);
-  mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, 'image.png'), out);
+  screened.sort((a, b) => a.bytes - b.bytes);
+  let best = null;
+  const finals = screened.slice(0, 3);
+  for (const cand of finals) {
+    const tries = [{ level: 9, memLevel: 9 }];
+    if (cand === finals[0]) tries.push({ level: 9, memLevel: 9, strategy: constants.Z_FILTERED });
+    for (const opts of tries) {
+      const z = deflateSync(cand.data, opts);
+      const png = pngOfForm(width, height, cand.form, new Uint8Array(z.buffer, z.byteOffset, z.length));
+      if (best === null || png.length < best.length) best = png;
+    }
+  }
+  return best;
+}
+
+for (const id of readdirSync(I).sort()) {
+  const image = decodePng(new Uint8Array(readFileSync(join(I, id, 'image.png'))));
+  mkdirSync(join(O, id), { recursive: true });
+  writeFileSync(join(O, id, 'image.png'), squeeze(image.rgba, image.width, image.height));
 }
